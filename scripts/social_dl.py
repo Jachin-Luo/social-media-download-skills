@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""social_dl.py — 社媒下载统一编排入口（新架构）。
+"""social_dl.py — 社媒下载统一编排入口。
 
-设计原则（2026-09-03 实跑复盘）：
-- 数组传参调子进程，不拼 shell（中文长文件名/空格/！安全）。
-- 抖音 CLI 的 config.link 污染：每次生成隔离 task-config，强制 link: []。
-- 飞书上传必须 cwd=中转目录 + 相对路径 ./name（绝对路径会被 lark-cli 拒）。
-- 同一目标目录串行上传；远端 ls 对账通过才算成功；try/finally 清理。
-- 不做 vision 识别（省 token），只做文件级校验。
+架构（与上游解耦后）
+--------------------
+- 本文件**不认识**任何上游 CLI：可执行名、参数名、配置格式、登录态文件
+  全部封装在 `backends/` 的适配器里。新增平台 = 加一个适配器，本文件不动。
+- 上游参数由适配器跑 `--help` 协商得出（`Backend.flag()`）。上游把 `--url`
+  改成 `-u` 会自动命中；两边都对不上则抛 `BackendError` 明确报错，而不是拿
+  猜出来的参数去跑（后者会静默下载错误内容）。
+- 升级上游后跑 `doctor` 做契约自检，能立刻发现破坏性变更。
 
-用法示例：
-    python3 social_dl.py --init --non-interactive --yes
-    python3 social_dl.py run --url "https://v.douyin.com/xxx/" --verify-remote --cleanup
-    python3 social_dl.py download --url "https://v.douyin.com/xxx/"
-    python3 social_dl.py upload-feishu --task <task_dir> --name "2026-09-03_14-56-39"
-    python3 social_dl.py upload-baidu --task <task_dir> --remote-dir "social-media-download/xxx"
+用法
+----
+    python3 social_dl.py doctor
+    python3 social_dl.py run       --url "<链接>" --cleanup
+    python3 social_dl.py download  --url "<链接>"
+    python3 social_dl.py poll      --task <task_dir>
+    python3 social_dl.py upload-feishu --task <task_dir> --name "归档名"
+    python3 social_dl.py upload-baidu  --task <task_dir> --name "归档名"
+
+设计红线
+--------
+- 数组传参调子进程，绝不拼 shell（中文长文件名/空格/! 安全）。
+- 日志走 stderr，结构化结果走 stdout（可被程序直接 json.loads）。
+- 同目录上传串行、跨目标按类型分流；远端对账通过才算成功。
+- 无论成功失败都在 finally 里清理本次任务目录，并如实上报残留。
 """
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import re
@@ -27,97 +37,100 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
-SKILL_DIR = Path(__file__).resolve().parent.parent
-# 保证 from init_wizard import 在任意 cwd 下可用
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from backends import (  # noqa: E402
+    IMAGE_EXT, VIDEO_EXT, is_partial,
+    all_backends, detect_platform, get_backend, platform_label,
+)
+from backends.base import BackendError  # noqa: E402
+
+SKILL_DIR = SCRIPTS_DIR.parent
 DATA_DIR = Path(os.environ.get(
     "SOCIAL_DL_DATA_DIR",
     str(Path.home() / ".local/share/social-media-download-skills"),
 ))
 CONFIG_PATH = DATA_DIR / "config.local.json"
 
+# 各平台默认超时（秒）。B 站大视频给足时间；0 表示采用这里的值
+PLATFORM_TIMEOUT = {"bilibili": 1800, "douyin": 600, "xiaohongshu": 600}
+POLL_INTERVAL = 5
+
+# 归档名模板占位符
+DEFAULT_NAME_TEMPLATE = "{date}"
+INVALID_CHARS = re.compile(r'[\\/:*?"<>|\r\n\t]')
+
 
 def log(*a):
-    print(*a, flush=True)
+    """日志一律走 stderr，保证 stdout 只有一份可解析的 JSON。"""
+    print(*a, file=sys.stderr, flush=True)
 
 
-def load_config():
+def load_config() -> dict:
     try:
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except OSError:
+    except (OSError, ValueError):
         return {}
 
 
-def detect_platform(url):
-    u = url.lower()
-    if "douyin.com" in u:
-        return "douyin"
-    if "bilibili.com" in u or "b23.tv" in u:
-        return "bilibili"
-    if "xiaohongshu.com" in u or "xhslink.com" in u:
-        return "xiaohongshu"
-    return ""
+# ---------------------------------------------------------------- 工具
+
+def clean_name(s: str, maxlen: int = 60) -> str:
+    """清洗成安全的目录/文件名片段。"""
+    s = INVALID_CHARS.sub("_", s or "")
+    s = re.sub(r"\s+", " ", s).strip(" .")
+    s = re.sub(r"_{2,}", "_", s)
+    return s[:maxlen].strip("_ ")
 
 
-POLL_INTERVAL = 5
+def build_archive_name(template: str, platform: str, meta: dict, started: str) -> str:
+    """按模板生成归档名。
 
-
-def exec_bg(cmd, cwd, logfile, timeout=600, interval=POLL_INTERVAL):
-    """全部耗时外部命令统一入口：后台脱离启动 + pid 文件 + 轮询等待。
-
-    返回 (rc, 日志全文尾部)。超时返回 (124, 尾部)，进程留后台继续跑，
-    调用方凭 task 目录用 `poll --task` 续看，绝不重复启动。
+    默认 `{date}` 即纯时间戳（向后兼容）。用户可用
+    `--name-template "{platform}_{title}_{day}"` 换成可读形式。
     """
-    import time
-    Path(logfile).parent.mkdir(parents=True, exist_ok=True)
-    lf = open(logfile, "a", encoding="utf-8")
-    lf.write(f"$ {' '.join(cmd)}\n")
-    lf.flush()
-    p = subprocess.Popen(cmd, cwd=str(cwd), stdout=lf, stderr=subprocess.STDOUT,
-                         start_new_session=True)
-    Path(str(logfile) + ".pid").write_text(str(p.pid), encoding="utf-8")
-    log(f"[bg] pid={p.pid} log={logfile}")
-    waited = 0
-    while waited < timeout:
-        code = p.poll()
-        if code is not None:
-            lf.write(f"\n[exit {code}]\n")
-            lf.close()
-            return code, "\n".join(log_tail(logfile, 200))
-        time.sleep(interval)
-        waited += interval
-    lf.close()
-    return 124, "\n".join(log_tail(logfile, 50))
+    meta = meta or {}
+    values = {
+        "platform": platform_label(platform),
+        "title": clean_name(meta.get("title") or "", 40) or "无标题",
+        "author": clean_name(meta.get("author") or meta.get("uploader") or "", 20),
+        "date": started,
+        "day": started[:10],
+    }
+    name = template or DEFAULT_NAME_TEMPLATE
+    for k, v in values.items():
+        name = name.replace("{%s}" % k, v)
+    return clean_name(name, 80) or started
 
 
-def pid_alive(pid):
+def run_capture(cmd: list, timeout: int = 120, cwd=None):
+    """跑短命令，异常不外抛，统一返回 (rc, stdout, stderr)。"""
     try:
-        os.kill(pid, 0)
-        return True
-    except (OSError, ValueError):
-        return False
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, cwd=str(cwd) if cwd else None)
+        return p.returncode, p.stdout or "", p.stderr or ""
+    except FileNotFoundError:
+        return 127, "", "command not found: %s" % cmd[0]
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout: %s" % " ".join(cmd)
+    except (OSError, subprocess.SubprocessError) as e:
+        return 126, "", "%s: %s" % (type(e).__name__, e)
 
 
-def read_pid(logfile):
+def log_tail(logfile, n: int = 15) -> list:
     try:
-        return int(Path(str(logfile) + ".pid").read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
-        return -1
-
-
-def log_tail(logfile, n=15):
-    try:
-        lines = Path(logfile).read_text(encoding="utf-8", errors="ignore").splitlines()
-        return lines[-n:]
+        return Path(logfile).read_text(encoding="utf-8", errors="ignore").splitlines()[-n:]
     except OSError:
         return []
 
 
 def log_exit(logfile):
-    """从日志尾部找 [exit N]，返回码或 None。"""
     for line in reversed(log_tail(logfile, 5)):
         m = re.search(r"\[exit (-?\d+)\]", line)
         if m:
@@ -125,341 +138,701 @@ def log_exit(logfile):
     return None
 
 
-def run_json(cmd, cwd):
-    """跑短命令并解析 stdout 中的 JSON（lark-cli --format json）。"""
-    p = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=120)
-    txt = (p.stdout or "").strip()
+def read_pid(logfile) -> int:
     try:
-        start = txt.index("{")
-        return p.returncode, json.loads(txt[start:])
-    except (ValueError, json.JSONDecodeError):
-        return p.returncode, {"ok": False, "raw": txt[-500:], "stderr": (p.stderr or "")[-300:]}
+        return int(Path(str(logfile) + ".pid").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return -1
 
 
-# ---------------- 抖音下载 ----------------
-
-def make_isolated_config(vendor_dir, task_dir):
-    """复制 vendor config.yml -> task-config.yml 并强制 link: []。"""
-    src = Path(vendor_dir) / "config.yml"
-    if not src.exists():
-        src = Path(vendor_dir) / "config.example.yml"
-    text = src.read_text(encoding="utf-8")
-    text = re.sub(r"link:\s*\n(\s*-\s*.*\n)+", "link: []\n", text)
-    text = re.sub(r"(?m)^link:[ \t]+\S.*$", "link: []", text)  # link 单行字符串形态也清空（已是 [] 时幂等）
-    if "link:" not in text:
-        text = "link: []\n" + text
-    dst = Path(task_dir) / "task-config.yml"
-    dst.write_text(text, encoding="utf-8")
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
-        os.chmod(dst, 0o600)
-    except OSError:
-        pass
-    return str(dst)
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
 
 
-def douyin_download(url, task_dir, timeout=600):
-    vendor = DATA_DIR / "douyin-downloader"
-    if not vendor.exists():
-        return 2, "vendor 缺失，请先跑: python3 social_dl.py --init --non-interactive --yes"
-    cfg = make_isolated_config(vendor, task_dir)
-    logpath = str(Path(task_dir) / "download.log")
-    rc, _ = exec_bg(["uv", "run", "douyin-dl", "--url", url,
-                     "--path", str(task_dir), "--config", cfg],
-                    cwd=str(vendor), logfile=logpath, timeout=timeout)
-    return rc, logpath
+def read_progress(backend, logfile, tail_lines: int = 40):
+    """从日志尾部解析最新进度（0-100），解析不出返回 None。"""
+    for line in reversed(log_tail(logfile, tail_lines)):
+        p = backend.parse_progress(line)
+        if p is not None:
+            return round(p, 1)
+    return None
 
 
-def bilibili_download(url, task_dir, timeout=900):
-    logpath = str(Path(task_dir) / "download.log")
-    rc, _ = exec_bg(["yutto", url, "-d", str(task_dir)],
-                    cwd=str(task_dir), logfile=logpath, timeout=timeout)
-    return rc, logpath
+# ---------------------------------------------------------------- 后台执行
+
+SECRET_RE = re.compile(r"(--(?:cookie|token|password|secret|key|auth)\S*)([= ])(\S+)", re.I)
 
 
-def xiaohongshu_download(url, task_dir, timeout=600):
-    vendor = DATA_DIR / "XHS-Downloader"
-    if not vendor.exists():
-        return 2, "vendor 缺失，请先跑: python3 social_dl.py --init --non-interactive --yes"
-    logpath = str(Path(task_dir) / "download.log")
-    rc, _ = exec_bg(["uv", "run", "python", "-c",
-                     "from source.CLI.main import cli; cli()",
-                     "--url", url, "--work_path", str(task_dir),
-                     "--folder_name", "media"],
-                    cwd=str(vendor), logfile=logpath, timeout=timeout)
-    return rc, logpath
+def mask_secrets(s: str) -> str:
+    """命令落盘前脱敏：SKILL.md 明确禁止凭证进入命令行日志。"""
+    return SECRET_RE.sub(lambda m: "%s%s***" % (m.group(1), m.group(2)), s)
 
 
-def read_manifest(task_dir):
-    mp = Path(task_dir) / "download_manifest.jsonl"
-    if not mp.exists():
-        return {}
+def exec_bg(cmd, cwd, logfile, timeout=600, interval=POLL_INTERVAL):
+    """耗时外部命令统一入口：后台脱离启动 + pid + 独立日志 + 轮询。
+
+    超时返回 (124, 日志尾)，进程留后台继续跑，凭 task 目录用 `poll` 续看，
+    绝不重复启动。
+    """
+    Path(logfile).parent.mkdir(parents=True, exist_ok=True)
+    lf = open(logfile, "a", encoding="utf-8")
+    lf.write("$ %s\n" % mask_secrets(" ".join(cmd)))
+    lf.flush()
     try:
-        line = mp.read_text(encoding="utf-8").strip().splitlines()[0]
-        return json.loads(line)
-    except (OSError, IndexError, json.JSONDecodeError):
-        return {}
+        p = subprocess.Popen(cmd, cwd=str(cwd), stdout=lf, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+    except (OSError, ValueError) as e:
+        lf.write("\n[spawn failed] %s\n" % e)
+        lf.close()
+        return 127, ["[spawn failed] %s" % e]
+    Path(str(logfile) + ".pid").write_text(str(p.pid), encoding="utf-8")
+    log("[bg] pid=%s log=%s" % (p.pid, logfile))
+    waited = 0
+    while waited < timeout:
+        code = p.poll()
+        if code is not None:
+            lf.write("\n[exit %s]\n" % code)
+            lf.close()
+            return code, log_tail(logfile, 200)
+        time.sleep(interval)
+        waited += interval
+    lf.close()
+    return 124, log_tail(logfile, 50)
 
 
-def collect_media(task_dir):
-    """返回 ([images], [videos]) 绝对路径。"""
+# ---------------------------------------------------------------- 媒体收集与校验
+
+def collect_media(task_dir: Path):
+    """返回 ([图片], [视频])，排除未完成的中间产物。
+
+    P0-6：扩展名包含 .m4s —— yutto 下载高清视频先落音视频流再合并，
+    合并失败时编排器必须能"看见"这些流，否则 SKILL.md 写的恢复流程无从触发。
+    """
     imgs, vids = [], []
-    for pat in ("**/*.jpg", "**/*.jpeg", "**/*.png", "**/*.webp"):
-        imgs += [str(p) for p in Path(task_dir).glob(pat) if p.is_file()]
-    for pat in ("**/*.mp4", "**/*.mkv", "**/*.webm"):
-        vids += [str(p) for p in Path(task_dir).glob(pat)
-                 if p.is_file() and not p.name.endswith(".tmp")]
-    return sorted(imgs), sorted(vids)
+    for p in sorted(Path(task_dir).rglob("*")):
+        if not p.is_file() or is_partial(p):
+            continue
+        suf = p.suffix.lower()
+        if suf in IMAGE_EXT:
+            imgs.append(str(p))
+        elif suf in VIDEO_EXT:
+            vids.append(str(p))
+    return imgs, vids
 
 
-def verify_local(files):
-    """文件存在且 >0。视频抽查 ffprobe，图片抽查文件头。"""
+def _image_complete(p: Path) -> bool:
+    """图片完整性：文件头 + 文件尾双校验。
+
+    P1-9：只验文件头会放过截断的 JPEG（它的头是完整的），必须验尾标记。
+    """
+    try:
+        if p.stat().st_size < 12:
+            return False
+        with open(p, "rb") as fh:
+            head = fh.read(12)
+        if head[:3] == b"\xff\xd8\xff":                       # JPEG
+            with open(p, "rb") as fh:
+                fh.seek(-2, os.SEEK_END)
+                return fh.read(2) == b"\xff\xd9"
+        if head[:8] == b"\x89PNG\r\n\x1a\n":                  # PNG
+            with open(p, "rb") as fh:
+                fh.seek(-8, os.SEEK_END)
+                return fh.read(8) == b"IEND\xaeB`\x82"
+        if head[:4] == b"RIFF" and head[8:12] == b"WEBP":     # WEBP
+            return True
+        if head[:6] in (b"GIF87a", b"GIF89a"):                # GIF
+            return True
+        return True                                            # 其余仅做基础校验
+    except OSError:
+        return False
+
+
+def verify_local(files) -> list:
     bad = []
     for f in files:
         p = Path(f)
         if not p.exists() or p.stat().st_size == 0:
-            bad.append(f)
+            bad.append(str(p))
             continue
-        if p.suffix.lower() in (".mp4", ".mkv", ".webm"):
-            r = subprocess.run(["ffprobe", "-v", "quiet", "-show_format", str(p)],
-                               capture_output=True, text=True, timeout=60)
-            if r.returncode != 0:
-                bad.append(f)
-        elif p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
-            with open(p, "rb") as fh:
-                head = fh.read(4)
-            if len(head) < 4:
-                bad.append(f)
+        suf = p.suffix.lower()
+        if suf in VIDEO_EXT:
+            rc, _, _ = run_capture(["ffprobe", "-v", "quiet", "-show_format", str(p)], 60)
+            if rc != 0:
+                bad.append(str(p))
+        elif suf in IMAGE_EXT:
+            if not _image_complete(p):
+                bad.append(str(p))
     return bad
 
 
-# ---------------- 飞书上传（相对路径串行） ----------------
+# ---------------------------------------------------------------- 溯源 manifest
 
-def feishu_mkdir(name, parent=""):
+def _safe_size(f) -> int:
+    try:
+        return Path(f).stat().st_size
+    except OSError:
+        return 0
+
+
+def build_manifest(url, platform, backend_name, started, imgs, vids, meta) -> dict:
+    """溯源信息：记录内容从哪来。随归档一起进云盘，便于日后回查出处。"""
+    meta = meta or {}
+    files = [{"name": Path(f).name, "type": "image", "size": _safe_size(f)} for f in imgs]
+    files += [{"name": Path(f).name, "type": "video", "size": _safe_size(f)} for f in vids]
+    return {
+        "schema": "social-media-download-skills/manifest@1",
+        "source_url": url,
+        "platform": platform,
+        "platform_label": platform_label(platform),
+        "backend": backend_name,
+        "downloaded_at": started,
+        "title": meta.get("title", ""),
+        "author": meta.get("author") or meta.get("uploader") or "",
+        "counts": {"images": len(imgs), "videos": len(vids)},
+        "files": files,
+        "note": "本文件由 social-media-download-skills 生成，用于记录内容来源。",
+    }
+
+
+def write_manifest(task_dir: Path, data: dict) -> str:
+    p = Path(task_dir) / "manifest.json"
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(p)
+
+
+def read_upstream_manifest(task_dir: Path) -> dict:
+    """上游下载器产出的 download_manifest.jsonl：取首个作品的元数据。"""
+    mp = Path(task_dir) / "download_manifest.jsonl"
+    if not mp.exists():
+        return {}
+    try:
+        for line in mp.read_text(encoding="utf-8").strip().splitlines():
+            if line.strip():
+                return json.loads(line)
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+# ---------------------------------------------------------------- 飞书
+
+def run_json(cmd, cwd=None, timeout: int = 120):
+    rc, out, err = run_capture(cmd, timeout=timeout, cwd=cwd)
+    txt = out.strip()
+    try:
+        return rc, json.loads(txt[txt.index("{"):])
+    except (ValueError, IndexError):
+        return rc, {"ok": False, "raw": txt[-500:], "stderr": err[-300:]}
+
+
+def feishu_mkdir(name: str, parent: str = ""):
     cmd = ["lark-cli", "drive", "+create-folder", "--name", name,
            "--as", "user", "--format", "json"]
     if parent:
         cmd += ["--folder-token", parent]
     rc, data = run_json(cmd, cwd=str(DATA_DIR))
-    if rc == 0 and data.get("ok") and data.get("data", {}).get("folder_token"):
-        return data["data"]["folder_token"], data["data"]
+    if rc == 0 and data.get("ok") and (data.get("data") or {}).get("folder_token"):
+        return data["data"]["folder_token"], data
     return "", data
 
 
-def feishu_upload_serial(files, folder_token):
-    """中转到 staging（原文件名保留），cwd=staging + ./相对路径串行上传。"""
+def feishu_upload_serial(files, folder_token: str):
+    """中转到 staging 后，cwd=staging + ./相对路径 串行上传。
+
+    P0-1 修复：不同子目录的同名文件（社媒下载极常见，如多个 1.jpg）直接复制
+    到同一 staging 会互相覆盖，导致上传错误内容、而数量仍然"对得上"——
+    这是最危险的一类 bug：不报错，但东西是错的。这里做同名去重。
+    """
     staging = Path(tempfile.mkdtemp(prefix="feishu-stage-", dir="/tmp"))
-    results = []
+    results, used, mapping = [], {}, []
     try:
         for src in files:
-            shutil.copy(src, staging / Path(src).name)
-        for src in files:
             name = Path(src).name
+            if name in used:                      # 同名 -> 加序号后缀
+                used[name] += 1
+                name = "%s__%d%s" % (Path(name).stem, used[name], Path(name).suffix)
+            else:
+                used[name] = 0
+            try:
+                shutil.copy(src, staging / name)
+            except OSError as e:
+                results.append({"file": Path(src).name, "ok": False, "file_token": "",
+                                "raw": "staging copy failed: %s" % e})
+                return results
+            mapping.append((src, name))
+        for src, name in mapping:
             cmd = ["lark-cli", "drive", "+upload", "--file", "./" + name,
                    "--folder-token", folder_token, "--as", "user", "--format", "json"]
             rc, data = run_json(cmd, cwd=str(staging))
             ok = rc == 0 and data.get("ok")
-            results.append({"file": name,
-                            "ok": ok,
-                            "file_token": (data.get("data") or {}).get("file_token", "") if ok else "",
-                            "raw": "" if ok else json.dumps(data, ensure_ascii=False)[:300]})
+            results.append({
+                "file": Path(src).name, "ok": ok,
+                "file_token": ((data.get("data") or {}).get("file_token", "") if ok else ""),
+                "raw": "" if ok else json.dumps(data, ensure_ascii=False)[:300],
+            })
             if not ok:
-                break  # 同目录串行，失败即停
+                break                              # 同目录串行，失败即停
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return results
 
 
-def feishu_verify(folder_token):
+def feishu_verify(folder_token: str):
+    """返回 (总数, parent_token 匹配数, 不匹配的文件名)。
+
+    P1-4：SKILL.md 要求逐个比对 parent_token，而不是只数个数。
+    """
     cmd = ["lark-cli", "drive", "files", "list",
            "--params", json.dumps({"folder_token": folder_token, "page_size": 100}),
            "--format", "json"]
     rc, data = run_json(cmd, cwd=str(DATA_DIR))
     if rc != 0 or not data.get("ok"):
-        return -1
-    files = (data.get("data") or {}).get("files", [])
-    return len(files)
+        return -1, -1, []
+    files = (data.get("data") or {}).get("files", []) or []
+    bad = [f.get("name", "?") for f in files if f.get("parent_token") != folder_token]
+    return len(files), len(files) - len(bad), bad
 
 
-# ---------------- 百度盘上传 ----------------
+# ---------------------------------------------------------------- 百度盘
 
-def baidu_mkdir(remote_dir):
-    p = subprocess.run(["bdpan", "mkdir", remote_dir],
-                       capture_output=True, text=True, timeout=60)
-    return p.returncode == 0 or "已存在" in (p.stdout + p.stderr)
+def baidu_mkdir(remote_dir: str) -> bool:
+    rc, out, err = run_capture(["bdpan", "mkdir", remote_dir], 60)
+    return rc == 0 or "已存在" in (out + err)
 
 
-def baidu_upload(local_file, remote_file, task_dir=""):
+def baidu_upload(local_file: str, remote_file: str, task_dir: str = "") -> tuple:
     logdir = Path(task_dir) / "logs" if task_dir else Path(tempfile.mkdtemp(prefix="bd-", dir="/tmp"))
     logdir.mkdir(parents=True, exist_ok=True)
     tag = re.sub(r"\W+", "_", Path(local_file).name)[:40]
     rc, tail = exec_bg(["bdpan", "upload", local_file, remote_file],
-                       cwd=str(task_dir or "/tmp"),
-                       logfile=str(logdir / f"upload-{tag}.log"), timeout=900)
-    ok = rc == 0 and ("上传成功" in tail or "成功" in tail)
-    return ok, tail[-500:]
+                       cwd=task_dir or "/tmp",
+                       logfile=str(logdir / ("upload-%s.log" % tag)), timeout=1800)
+    # P1-6：中文关键词只做辅助判据（"成功"可能来自"失败后重试成功"，
+    # 也可能被进度输出挤出尾部），最终以远端对账为准。
+    joined = "\n".join(tail)
+    kw = ("上传成功" in joined) or ("成功" in "\n".join(tail[-3:]))
+    return (rc == 0 and kw), rc, joined[-500:]
 
 
-def baidu_verify(remote_dir):
-    """--json 结构化对账：数非目录项，不怕换行/特殊字符文件名。"""
-    p = subprocess.run(["bdpan", "ls", "/apps/bdpan/" + remote_dir.lstrip("/"), "--json"],
-                       capture_output=True, text=True, timeout=60)
-    if p.returncode != 0:
+def baidu_verify(remote_dir: str) -> int:
+    """--json 结构化对账：数非目录项。不可用返回 -1（表示"未验证"而非 0）。"""
+    rc, out, _ = run_capture(
+        ["bdpan", "ls", "/apps/bdpan/" + remote_dir.lstrip("/"), "--json"], 60)
+    if rc != 0:
         return -1
     try:
-        items = json.loads(p.stdout.strip())
+        items = json.loads(out.strip())
         return sum(1 for it in items if not it.get("isdir", False))
     except (ValueError, TypeError, AttributeError):
         return -1
 
 
-# ---------------- 主流程 ----------------
+def unique_remote_dir(base: str, name: str) -> str:
+    """P1-7：同秒并发会撞同名远端目录，导致文件串目录且对账误判成功。
 
-def cmd_run(args):
-    started = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    task_dir = args.task or tempfile.mkdtemp(prefix="social-media-", dir="/tmp")
-    os.makedirs(task_dir, exist_ok=True)
-    log(f"[run] task={task_dir} start={started}")
+    已存在且非空时追加 -2/-3...
+    """
+    rdir = "%s/%s" % (base, name)
+    i = 2
+    while baidu_verify(rdir) > 0 and i < 20:
+        rdir = "%s/%s-%d" % (base, name, i)
+        i += 1
+    return rdir
+
+
+# ---------------------------------------------------------------- 上传编排
+
+def upload_to_feishu(files, name, cfg, task_dir, result) -> bool:
+    token, raw = feishu_mkdir(name, cfg.get("feishu_parent_folder_token", ""))
+    if not token:
+        result.setdefault("errors", []).append(
+            {"stage": "mkdir-feishu",
+             "detail": json.dumps(raw, ensure_ascii=False)[:300]})
+        return False
+    res = feishu_upload_serial(files, token)
+    total, matched, bad = feishu_verify(token)
+    result["feishu"] = {"folder_token": token,
+                        "uploaded": sum(1 for r in res if r["ok"]),
+                        "expected": len(files),
+                        "remote_count": total,
+                        "parent_matched": matched,
+                        "mismatched": bad}
+    ok = all(r["ok"] for r in res) and matched >= len(files)
+    if not ok:
+        result.setdefault("errors", []).append(
+            {"stage": "upload-feishu",
+             "detail": "上传 %d/%d，远端匹配 %s/%d" %
+                       (sum(1 for r in res if r["ok"]), len(files), matched, len(files)),
+             "failed": [r for r in res if not r["ok"]][:5]})
+    return ok
+
+
+def upload_to_baidu(files, name, cfg, task_dir, result) -> bool:
+    base = cfg.get("baidu_base", "social-media-download")
+    rdir = unique_remote_dir(base, name)
+    baidu_mkdir(rdir)
+    ups, ok_all = [], True
+    for f in files:
+        ok, rc, tail = baidu_upload(f, "%s/%s" % (rdir, Path(f).name), task_dir)
+        ups.append({"file": Path(f).name, "ok": ok, "exit": rc,
+                    "raw": "" if ok else tail[-200:]})
+        if not ok:
+            ok_all = False
+            log("[baidu] 上传失败 %s: %s" % (Path(f).name, tail[-200:]))
+            break
+    n = baidu_verify(rdir)
+    result["baidu"] = {"remote_dir": rdir,
+                       "uploaded": sum(1 for x in ups if x["ok"]),
+                       "expected": len(files),
+                       "remote_count": n}
+    if not ok_all:
+        result.setdefault("errors", []).append(
+            {"stage": "upload-baidu", "failed": [x for x in ups if not x["ok"]][:5]})
+    # remote_count == -1 表示对账不可用（如 bdpan 不支持 --json），
+    # 此时只以上传回执为准，不因此判失败
+    return ok_all
+
+
+def plan_uploads(dest: str, imgs, vids, cfg):
+    """P0-5：媒体按类型分流到各自目标，而不是整个任务走单一目标。
+
+    SKILL.md 核心契约：视频 -> 百度网盘，图片 -> 飞书云盘。
+    混合媒体（如小红书图文+视频）必须分开走，否则图片会被塞进百度盘。
+    """
+    if dest == "baidu":
+        return [("baidu", list(vids) + list(imgs))] if (vids or imgs) else []
+    if dest == "feishu":
+        return [("feishu", list(vids) + list(imgs))] if (vids or imgs) else []
+    plan = []
+    if vids:
+        plan.append(("baidu", list(vids)))
+    if imgs:
+        plan.append(("feishu", list(imgs)))
+    return plan
+
+
+# ---------------------------------------------------------------- 主流程
+
+def _run_inner(args, task_dir, started, result) -> int:
     platform = detect_platform(args.url)
     if not platform:
-        print(json.dumps({"ok": False, "stage": "parse", "error": "invalid_input"},
-                         ensure_ascii=False))
+        result.update(ok=False, stage="parse", error="invalid_input",
+                      hint="URL 未识别为 B站/抖音/小红书链接")
         return 1
+
+    backend = get_backend(platform, DATA_DIR)
+    result.update(platform=platform, backend=backend.name,
+                  install_mode=backend.install_mode())
+    # 记录平台元信息，供 poll 推断后端以解析进度
+    try:
+        (Path(task_dir) / "run_meta.json").write_text(
+            json.dumps({"platform": platform, "backend": backend.name},
+                       ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+    # 后端可用性：比"vendor 缺失"那种模糊报错更早、更明确
+    avail, detail = backend.available()
+    if not avail:
+        result.update(ok=False, stage="backend", error="backend_unavailable",
+                      detail=detail,
+                      hint="先跑 `python3 scripts/init_wizard.py` 启用该平台")
+        return 1
+
+    timeout = args.timeout or PLATFORM_TIMEOUT.get(platform, 600)
     logpath = str(Path(task_dir) / "download.log")
-    if args.task and "[exit 0]" in "\n".join(log_tail(logpath, 5)):
-        # 断点续跑：后台已完成的下载不重复启动，直接沿用文件
+
+    # --- 下载（断点续跑沿用原逻辑：上次 exit 0 且已有成品文件则跳过） ---
+    if args.task and log_exit(logpath) == 0:
         pre_imgs, pre_vids = collect_media(task_dir)
         if pre_imgs or pre_vids:
             log("[run] 断点续跑：沿用已完成的下载")
-            rc, info = 0, logpath
+            rc, tail = 0, log_tail(logpath, 50)
         else:
-            rc, info = -1, logpath
-    elif platform == "douyin":
-        rc, info = douyin_download(args.url, task_dir, args.timeout)
-    elif platform == "bilibili":
-        rc, info = bilibili_download(args.url, task_dir, args.timeout)
+            rc, tail = -1, log_tail(logpath, 50)
     else:
-        rc, info = xiaohongshu_download(args.url, task_dir, args.timeout)
+        try:
+            ctx = backend.prepare(Path(task_dir))      # 如抖音的隔离 config
+            cmd = backend.build_cmd(args.url, Path(task_dir), ctx)
+        except BackendError as e:
+            result.update(ok=False, stage="backend", error="contract_break",
+                          capability=e.capability, detail=str(e),
+                          hint="上游 CLI 参数可能已变更，跑 `doctor` 确认后更新适配器 CAPS")
+            return 1
+        rc, tail = exec_bg(cmd, cwd=str(task_dir), logfile=logpath, timeout=timeout)
+
     if rc == 124:
-        print(json.dumps({"ok": False, "stage": "download", "status": "running",
-                          "poll": f"social_dl.py poll --task {task_dir}",
-                          "task_dir": task_dir}, ensure_ascii=False))
+        result.update(ok=False, stage="download", status="running",
+                      progress=read_progress(backend, logpath),
+                      poll="social_dl.py poll --task %s" % task_dir,
+                      hint="进程仍在后台运行，凭 task 目录续看，不要重复启动")
         return 124
     if rc != 0:
-        print(json.dumps({"ok": False, "stage": "download", "exit": rc,
-                          "log": info, "task_dir": task_dir}, ensure_ascii=False))
+        result.update(ok=False, stage="download", exit=rc, log=logpath,
+                      tail=tail[-8:], hint=backend.collect_hint())
         return 1
+
     imgs, vids = collect_media(task_dir)
     if not imgs and not vids:
-        # 后端常 exit 0 但 Success 0（如无 Cookie 被反爬），无文件必须判下载失败
-        print(json.dumps({"ok": False, "stage": "download", "error": "no_media_files",
-                          "log": info, "task_dir": task_dir}, ensure_ascii=False))
+        # B-4：这是最高频的失败（Cookie 过期 -> exit 0 但 0 文件），
+        # 必须给出可行动的提示，而不是干巴巴的 no_media_files
+        login_ok, login_msg = backend.login_state()
+        hint = backend.collect_hint()
+        if not login_ok:
+            hint = ("登录态可疑（%s）——这是 exit 0 但 0 文件的首要原因。%s"
+                    % (login_msg, hint))
+        result.update(ok=False, stage="download", error="no_media_files",
+                      log=logpath, tail=tail[-8:],
+                      login_ok=login_ok, login_detail=login_msg, hint=hint)
         return 1
+
     bad = verify_local(imgs + vids)
     if bad:
-        print(json.dumps({"ok": False, "stage": "verify", "bad": bad,
-                          "task_dir": task_dir}, ensure_ascii=False))
+        result.update(ok=False, stage="verify", bad=bad[:10],
+                      hint="文件不完整（空文件/截断/损坏），多为下载中断")
         return 1
-    manifest = read_manifest(task_dir)
-    result = {"ok": True, "stage": "downloaded", "platform": platform,
-              "manifest": manifest, "images": len(imgs), "videos": len(vids),
-              "task_dir": task_dir, "started": started}
-    # 按配置自动归档
-    cfg = load_config()
-    if args.dest == "auto":
-        dest = cfg.get("video_dest" if vids else "image_dest", "feishu" if imgs else "baidu")
-    else:
-        dest = args.dest
+
+    meta = read_upstream_manifest(task_dir)
+    result.update(ok=True, stage="downloaded", title=meta.get("title", ""),
+                  images=len(imgs), videos=len(vids), manifest=meta)
+
+    # --- 溯源 manifest：随归档一起进云盘 ---
+    manifest_path = write_manifest(Path(task_dir), build_manifest(
+        args.url, platform, backend.name, started, imgs, vids, meta))
+
     if args.no_upload:
-        print(json.dumps(result, ensure_ascii=False))
+        result["local_manifest"] = manifest_path
         return 0
-    if dest == "feishu" and (imgs or vids):
-        parent = cfg.get("feishu_parent_folder_token", "")
-        token, _ = feishu_mkdir(args.name or started, parent)
-        if not token:
-            print(json.dumps({"ok": False, "stage": "mkdir-feishu"}, ensure_ascii=False))
-            return 1
-        res = feishu_upload_serial(imgs + vids, token)
-        n = feishu_verify(token)
-        result.update({"dest": "feishu", "folder_token": token,
-                       "uploaded": sum(1 for r in res if r["ok"]),
-                       "remote_count": n})
-    elif dest == "baidu" and (vids or imgs):
-        base = cfg.get("baidu_base", "social-media-download")
-        rdir = f"{base}/{args.name or started}"
-        baidu_mkdir(rdir)
-        ups = []
-        for f in vids + imgs:
-            ok, tail = baidu_upload(f, f"{rdir}/{Path(f).name}", task_dir)
-            ups.append(ok)
-            if not ok:
-                log(f"[baidu] 上传失败 {f}: {tail[-200:]}")
-                break
-        n = baidu_verify(rdir)
-        result.update({"dest": "baidu", "remote_dir": rdir,
-                       "uploaded": sum(1 for x in ups if x), "remote_count": n})
-    print(json.dumps(result, ensure_ascii=False))
-    if args.cleanup:
-        shutil.rmtree(task_dir, ignore_errors=True)
-        result["cleaned"] = True
-    if not args.no_upload:
-        expected = len(imgs) + len(vids)
-        if result.get("uploaded", 0) < expected or result.get("remote_count", -1) < expected:
-            return 1
+
+    name = args.name or build_archive_name(args.name_template, platform, meta, started)
+    cfg = load_config()
+    result["archive_name"] = name
+
+    plan = plan_uploads(args.dest, imgs, vids, cfg)
+    if not plan:
+        result.update(ok=False, stage="upload", error="nothing_to_upload")
+        return 1
+
+    ok_all, expected_total = True, 0
+    for dest, files in plan:
+        # manifest.json 随每一组分流一起归档，保证任一侧都能追溯来源
+        group = [manifest_path] + list(files)
+        ok = (upload_to_feishu(group, name, cfg, task_dir, result) if dest == "feishu"
+              else upload_to_baidu(group, name, cfg, task_dir, result))
+        ok_all = ok_all and ok
+        expected_total += len(group)
+
+    result["dest"] = "auto-split" if len(plan) > 1 else (plan[0][0] if plan else "")
+    result["upload_expected"] = expected_total
+    if not ok_all:
+        result["ok"] = False
+        result.setdefault("stage", "upload")
+        return 1
     return 0
 
 
-def cmd_poll(args):
-    """只读轮询：pid 存活 + 日志尾 + 文件数。不做任何写入/启动。"""
-    task_dir = args.task
-    logpath = str(Path(task_dir) / "download.log")
+def cmd_run(args) -> int:
+    """外层：统一清理 + 统一输出，保证 cleaned 字段一定带出（P0-2/P0-3）。"""
+    started = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    task_dir = args.task or tempfile.mkdtemp(prefix="social-media-", dir="/tmp")
+    os.makedirs(task_dir, exist_ok=True)
+    result = {"ok": False, "task_dir": task_dir, "started": started}
+    code = 1
+    try:
+        code = _run_inner(args, task_dir, started, result)
+    except BackendError as e:
+        result.update(ok=False, stage="backend", error="contract_break",
+                      backend=e.backend, capability=e.capability, detail=str(e))
+        code = 1
+    except Exception as e:                                     # noqa: BLE001
+        result.update(ok=False, stage="unexpected",
+                      error="%s: %s" % (type(e).__name__, e))
+        code = 1
+    finally:
+        if args.cleanup:
+            try:
+                shutil.rmtree(task_dir)
+                result["cleaned"] = True
+            except OSError as e:
+                result["cleaned"] = False
+                result["residue"] = task_dir
+                result["clean_error"] = str(e)
+        print(json.dumps(result, ensure_ascii=False))
+    return code
+
+
+def cmd_poll(args) -> int:
+    """只读轮询：pid 存活 + 日志尾 + 文件数 + 进度。不做任何写入/启动。"""
+    task_dir = Path(args.task)
+    logpath = str(task_dir / "download.log")
     pid = read_pid(logpath)
     code = log_exit(logpath)
     imgs, vids = collect_media(task_dir)
+    platform, progress = "", None
+    meta_file = task_dir / "run_meta.json"
+    if meta_file.exists():
+        try:
+            platform = json.loads(meta_file.read_text(encoding="utf-8")).get("platform", "")
+        except (OSError, ValueError):
+            pass
+    if platform:
+        try:
+            progress = read_progress(get_backend(platform, DATA_DIR), logpath)
+        except BackendError:
+            pass
     print(json.dumps({
-        "task_dir": task_dir,
-        "download": {"pid": pid, "alive": pid_alive(pid) if pid > 0 else False,
+        "task_dir": str(task_dir),
+        "download": {"pid": pid, "alive": pid_alive(pid),
                      "exit": code, "tail": log_tail(logpath, 8)},
+        "progress": progress,
         "media": {"images": len(imgs), "videos": len(vids)},
-        "resume": f"social_dl.py run --url <链接> --task {task_dir}" if code == 0 else "",
+        "resume": ("social_dl.py run --url <链接> --task %s" % task_dir) if code == 0 else "",
     }, ensure_ascii=False))
     return 0
 
 
-def main(argv=None):
+def _collect_for_upload(task_dir: Path):
+    imgs, vids = collect_media(task_dir)
+    files = vids + imgs
+    mp = task_dir / "manifest.json"
+    if mp.exists():
+        files = [str(mp)] + files
+    return files
+
+
+def cmd_upload_feishu(args) -> int:
+    """从已存在的 task_dir 上传（下载成功后单独重传）。
+
+    P1-1：docstring 里早就写了这两个子命令，但此前从未注册，属于幽灵命令。
+    """
+    task_dir = Path(args.task)
+    if not task_dir.exists():
+        print(json.dumps({"ok": False, "error": "task_dir 不存在: %s" % task_dir},
+                         ensure_ascii=False))
+        return 1
+    files = _collect_for_upload(task_dir)
+    if not files:
+        print(json.dumps({"ok": False, "error": "no_media_files"}, ensure_ascii=False))
+        return 1
+    name = args.name or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    result = {"ok": False, "task_dir": str(task_dir), "archive_name": name}
+    ok = upload_to_feishu(files, name, load_config(), str(task_dir), result)
+    result["ok"] = ok
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if ok else 1
+
+
+def cmd_upload_baidu(args) -> int:
+    task_dir = Path(args.task)
+    if not task_dir.exists():
+        print(json.dumps({"ok": False, "error": "task_dir 不存在: %s" % task_dir},
+                         ensure_ascii=False))
+        return 1
+    files = _collect_for_upload(task_dir)
+    if not files:
+        print(json.dumps({"ok": False, "error": "no_media_files"}, ensure_ascii=False))
+        return 1
+    name = args.name or args.remote_dir or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    result = {"ok": False, "task_dir": str(task_dir), "archive_name": name}
+    ok = upload_to_baidu(files, name, load_config(), str(task_dir), result)
+    result["ok"] = ok
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if ok else 1
+
+
+def cmd_doctor(args) -> int:
+    """契约自检：确认各后端仍能协商出合法命令。升级上游后跑一次。"""
+    report, all_ok = [], True
+    for b in all_backends(DATA_DIR):
+        entry = {"platform": b.platform, "backend": b.name,
+                 "install_mode": b.install_mode(), "warnings": []}
+        avail, detail = b.available()
+        entry["available"] = avail
+        entry["detail"] = detail
+        if avail:
+            try:
+                entry["negotiated_flags"] = b.negotiate_all()
+            except BackendError as e:
+                entry["error"] = str(e)
+                entry["action"] = "上游可能已变更参数，确认后更新适配器 CAPS"
+                all_ok = False
+            if getattr(b, "unverified", None):
+                entry["warnings"].append(
+                    "以下能力未能用 --help 验证，已回退到首选参数：%s" % b.unverified)
+            try:
+                lg_ok, lg_msg = b.login_state()
+                entry["login"] = {"ok": lg_ok, "detail": lg_msg}
+            except Exception as e:                              # noqa: BLE001
+                entry["login"] = {"ok": False,
+                                  "detail": "%s: %s" % (type(e).__name__, e)}
+        else:
+            all_ok = False
+        report.append(entry)
+    print(json.dumps({"doctor": report, "all_ok": all_ok}, ensure_ascii=False, indent=2))
+    return 0 if all_ok else 1
+
+
+def main(argv=None) -> int:
     from init_wizard import main as init_main
-    ap = argparse.ArgumentParser(description="social-media-download-skills 新编排入口")
+
+    ap = argparse.ArgumentParser(description="social-media-download-skills 编排入口")
     ap.add_argument("--init", action="store_true", help="跑首次初始化向导")
-    sub = ap.add_subparsers(dest="cmd")
-    # --init 透传参数
     ap.add_argument("--non-interactive", action="store_true")
     ap.add_argument("--yes", action="store_true")
-    r = sub.add_parser("run", help="下载+校验+归档一站式")
+    sub = ap.add_subparsers(dest="cmd")
+
+    r = sub.add_parser("run", help="下载 + 校验 + 归档一站式")
     r.add_argument("--url", required=True)
     r.add_argument("--task", default="")
-    r.add_argument("--name", default="", help="归档文件夹名，默认任务开始时间")
+    r.add_argument("--name", default="", help="归档名；留空按模板生成")
+    r.add_argument("--name-template", default=DEFAULT_NAME_TEMPLATE,
+                   help="归档名模板，占位符 {platform} {title} {author} {date} {day}；"
+                        "默认 {date} 即时间戳")
     r.add_argument("--dest", default="auto", choices=["auto", "feishu", "baidu"])
-    r.add_argument("--timeout", type=int, default=600)
+    r.add_argument("--timeout", type=int, default=0, help="0 = 采用平台默认超时")
     r.add_argument("--no-upload", action="store_true")
     r.add_argument("--cleanup", action="store_true")
-    d = sub.add_parser("download", help="仅下载")
+
+    d = sub.add_parser("download", help="仅下载不上传")
     d.add_argument("--url", required=True)
     d.add_argument("--task", default="")
-    d.add_argument("--timeout", type=int, default=600)
+    d.add_argument("--timeout", type=int, default=0)
+    d.set_defaults(no_upload=True, dest="auto", name="", cleanup=False,
+                   name_template=DEFAULT_NAME_TEMPLATE)
+
     q = sub.add_parser("poll", help="只读轮询任务状态（不重复启动）")
     q.add_argument("--task", required=True)
-    args, rest = ap.parse_known_args(argv)
+
+    u = sub.add_parser("upload-feishu", help="从已有 task_dir 上传到飞书（跳过下载）")
+    u.add_argument("--task", required=True)
+    u.add_argument("--name", default="")
+
+    bd = sub.add_parser("upload-baidu", help="从已有 task_dir 上传到百度盘（跳过下载）")
+    bd.add_argument("--task", required=True)
+    bd.add_argument("--name", default="")
+    bd.add_argument("--remote-dir", default="")
+
+    sub.add_parser("doctor", help="契约自检：后端可用性与参数协商")
+
+    args, _rest = ap.parse_known_args(argv)
+
     if args.init:
         sys.argv = ["init_wizard.py"] + [x for x in (argv or []) if x != "--init"]
         return init_main()
-    if args.cmd == "download":
-        args.no_upload, args.dest, args.name, args.cleanup = True, "auto", "", False
-        return cmd_run(args)
-    if args.cmd == "run":
-        return cmd_run(args)
-    if args.cmd == "poll":
-        return cmd_poll(args)
-    ap.print_help()
-    return 1
+
+    handler = {"run": cmd_run, "download": cmd_run, "poll": cmd_poll,
+               "upload-feishu": cmd_upload_feishu, "upload-baidu": cmd_upload_baidu,
+               "doctor": cmd_doctor}.get(args.cmd)
+    if handler is None:
+        ap.print_help()
+        return 1
+    return handler(args)
 
 
 if __name__ == "__main__":
