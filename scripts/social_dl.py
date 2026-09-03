@@ -499,21 +499,38 @@ def upload_to_baidu(files, name, cfg, task_dir, result) -> bool:
     return ok_all
 
 
-def plan_uploads(dest: str, imgs, vids, cfg):
-    """P0-5：媒体按类型分流到各自目标，而不是整个任务走单一目标。
+VALID_DESTS = ("baidu", "feishu")
 
-    SKILL.md 核心契约：视频 -> 百度网盘，图片 -> 飞书云盘。
-    混合媒体（如小红书图文+视频）必须分开走，否则图片会被塞进百度盘。
+
+def resolve_dest(value, default):
+    """归一化上传目的地；非法值抛 ValueError，绝不静默回退默认。"""
+    v = str(value or default or "").strip().lower()
+    if v not in VALID_DESTS:
+        raise ValueError("非法上传目的地 %r（可选：baidu / feishu）" % value)
+    return v
+
+
+def plan_uploads(dest: str, imgs, vids, cfg):
+    """媒体按类型分流；auto 模式下目的地由配置决定，用户可配可覆盖。
+
+    优先级：--dest 显式指定 > CLI --video-dest/--image-dest > config.local.json > 默认值。
+    - dest=baidu/feishu：全部媒体走单一目标（用户显式指定，优先级最高）
+    - dest=auto（默认）：视频→cfg["video_dest"]（默认 baidu），
+      图片→cfg["image_dest"]（默认 feishu）。两键在 init 时询问用户，
+      运行时可用 --video-dest/--image-dest 单次覆盖。
+    混合媒体始终按类型分流，绝不混装到同一目标。
     """
     if dest == "baidu":
         return [("baidu", list(vids) + list(imgs))] if (vids or imgs) else []
     if dest == "feishu":
         return [("feishu", list(vids) + list(imgs))] if (vids or imgs) else []
+    video_dest = resolve_dest(cfg.get("video_dest"), "baidu")
+    image_dest = resolve_dest(cfg.get("image_dest"), "feishu")
     plan = []
     if vids:
-        plan.append(("baidu", list(vids)))
+        plan.append((video_dest, list(vids)))
     if imgs:
-        plan.append(("feishu", list(imgs)))
+        plan.append((image_dest, list(imgs)))
     return plan
 
 
@@ -612,9 +629,18 @@ def _run_inner(args, task_dir, started, result) -> int:
 
     name = args.name or build_archive_name(args.name_template, platform, meta, started)
     cfg = load_config()
+    # CLI 覆盖 > 配置 > 默认；非法值明确报错，绝不静默回退
+    try:
+        if getattr(args, "video_dest", ""):
+            cfg["video_dest"] = resolve_dest(args.video_dest, None)
+        if getattr(args, "image_dest", ""):
+            cfg["image_dest"] = resolve_dest(args.image_dest, None)
+        plan = plan_uploads(args.dest, imgs, vids, cfg)
+    except ValueError as e:
+        result.update(ok=False, stage="upload", error="invalid_upload_dest",
+                      hint=str(e))
+        return 1
     result["archive_name"] = name
-
-    plan = plan_uploads(args.dest, imgs, vids, cfg)
     if not plan:
         result.update(ok=False, stage="upload", error="nothing_to_upload")
         return 1
@@ -794,7 +820,12 @@ def main(argv=None) -> int:
     r.add_argument("--name-template", default=DEFAULT_NAME_TEMPLATE,
                    help="归档名模板，占位符 {platform} {title} {author} {date} {day}；"
                         "默认 {date} 即时间戳")
-    r.add_argument("--dest", default="auto", choices=["auto", "feishu", "baidu"])
+    r.add_argument("--dest", default="auto", choices=["auto", "feishu", "baidu"],
+                   help="auto=按配置分流（默认）；feishu/baidu=全部媒体走单一目标")
+    r.add_argument("--video-dest", default="", metavar="baidu|feishu",
+                   help="auto 模式下覆盖配置的视频目的地")
+    r.add_argument("--image-dest", default="", metavar="baidu|feishu",
+                   help="auto 模式下覆盖配置的图片目的地")
     r.add_argument("--timeout", type=int, default=0, help="0 = 采用平台默认超时")
     r.add_argument("--no-upload", action="store_true")
     r.add_argument("--cleanup", action="store_true")

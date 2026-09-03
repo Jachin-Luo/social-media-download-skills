@@ -1,6 +1,9 @@
 # social-media-download-skills
 
-个人公开作品下载归档：B 站 / 抖音 / 小红书 → 视频存百度网盘，图片存飞书云盘。
+个人公开作品下载归档：B 站 / 抖音 / 小红书 → 云盘归档。上传目的地可配置：
+init 时向导会询问（默认视频存百度网盘、图片存飞书云盘），也可在
+`config.local.json` 里改 `video_dest` / `image_dest`，或单次运行时用
+`--video-dest` / `--image-dest` / `--dest` 覆盖。
 
 固定后端、不降级、不换源；下载→校验→溯源 manifest→归档→远端对账→清理，全链路由 Python 编排（`scripts/social_dl.py`），耗时任务全部后台跑（pid + 日志 + 轮询）。
 
@@ -20,8 +23,10 @@ python3 scripts/init_wizard.py --platforms all --yes
 # 2. 契约自检：后端可用性 + 登录态 + 参数协商
 python3 scripts/social_dl.py doctor
 
-# 3. 一站式：下载 + 校验 + 溯源 manifest + 归档（视频→百度盘，图片→飞书）+ 清理
+# 3. 一站式：下载 + 校验 + 溯源 manifest + 归档 + 清理（目的地按配置分流）
 python3 scripts/social_dl.py run --url "<分享链接>" --cleanup
+#    想全部走一侧：--dest feishu 或 --dest baidu
+#    只想调一类：--video-dest feishu / --image-dest baidu
 
 #    归档名默认时间戳；想要可读名用模板（{platform} {title} {author} {date} {day}）
 python3 scripts/social_dl.py run --url "<链接>" --cleanup \

@@ -1,12 +1,14 @@
 ---
 name: social-media-download-skills
 description: >
-  下载 B站/抖音/小红书的公开视频或图片并归档到云盘：视频存百度网盘，
-  图片存飞书云盘，自动建归档目录、写溯源 manifest、远端对账、清理本地临时文件。
+  下载 B站/抖音/小红书的公开视频或图片并归档到云盘：上传目的地可配置
+  （默认视频存百度网盘、图片存飞书云盘，可在 init 时询问确定、改配置或
+  运行时用 --video-dest/--image-dest 覆盖），自动建归档目录、写溯源 manifest、
+  远端对账、清理本地临时文件。
   当用户提供这三类平台的分享链接（含 b23.tv / v.douyin.com / xhslink.com 短链）
   并要求下载、保存、归档、备份时使用。不用于绕过付费墙、DRM、登录权限，
   不用于批量抓取他人账号，不用于传播受版权保护的内容。
-version: 0.3.0
+version: 0.3.1
 author: 雒玉坤 (Jachin), Hermes Agent
 license: MIT
 allowed-tools: Bash, Read, Write
@@ -24,7 +26,8 @@ metadata:
 ## When to Use
 
 - 用户提供 B 站、抖音或小红书链接并要求下载。
-- 用户要求把下载的视频保存到百度网盘、图片上传到飞书云盘。
+- 用户要求把下载内容归档到百度网盘或飞书云盘（目的地可配置：默认视频→百度、
+  图片→飞书，也可全部走其中一侧）。
 
 不要用于：绕过付费墙/DRM/登录权限；批量抓取他人账号；未经授权传播受版权保护的内容。
 
@@ -63,7 +66,7 @@ python3 scripts/social_dl.py upload-feishu --task <task_dir> --name "<归档名>
 python3 scripts/social_dl.py upload-baidu  --task <task_dir> --name "<归档名>"
 ```
 
-编排器职责：任务目录、隔离 task-config、数组传参、按媒体类型分流上传（视频→百度，图片→飞书）、远端对账、`finally` 清理。不要绕过它手拼 bash。日志走 stderr，stdout 只有一份 JSON 结果（可直接 `json.loads`）。
+编排器职责：任务目录、隔离 task-config、数组传参、按媒体类型分流上传（目的地由配置决定，见下）、远端对账、`finally` 清理。不要绕过它手拼 bash。日志走 stderr，stdout 只有一份 JSON 结果（可直接 `json.loads`）。
 
 ## Procedure
 
@@ -73,7 +76,7 @@ python3 scripts/social_dl.py upload-baidu  --task <task_dir> --name "<归档名>
 4. **验证文件**：存在、>0；视频 ffprobe 校验，图片做头+尾完整性校验（截断的 JPEG 头是完整的，只验头会放过）。
 5. **溯源 manifest**：在任务目录写 `manifest.json`（来源 URL、平台、标题、作者、下载时间、文件清单），随归档一起进云盘。
 6. **归档命名**：默认时间戳；`--name-template` 可用 `{platform}` `{title}` 等占位符。模板清洗非法字符，标题缺失回退"无标题"。
-7. **分流上传**：auto 模式下视频→百度、图片→飞书分别建同名归档目录（混合媒体绝不把图片塞进百度盘）。飞书先建任务文件夹再串行上传（同名文件自动去重）；百度上传后 `--json` 对账。
+7. **分流上传**：auto 模式按配置分流——视频→`video_dest`（默认百度）、图片→`image_dest`（默认飞书），混合媒体绝不混装。目的地优先级：`--dest baidu/feishu`（全部走一侧）> `--video-dest`/`--image-dest`（单次覆盖）> `config.local.json` > 默认值；非法值明确报错。init 时向导会逐项询问用户。飞书先建任务文件夹再串行上传（同名文件自动去重）；百度上传后 `--json` 对账。
 8. **远端对账**：飞书逐文件比对 `parent_token`；百度数非目录项。对账不过即失败，明确报告"远端未确认成功"。
 9. **清理与报告**：无论成败，`finally` 里删除任务目录并如实上报 `cleaned`/`residue`。成功列出平台、标题、归档名、远程位置、清理状态；失败列出阶段、后端、退出码、原始错误和可行动的 hint。
 

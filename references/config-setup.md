@@ -12,8 +12,21 @@
 │   └── config.yml          # Cookie 在这里
 ├── XHS-Downloader/         # 源码 clone（启用 xiaohongshu 平台时）
 │   └── Volume/settings.json
-└── config.local.json       # 本 skill 自己的配置（视频/图片目标、归档模板等）
+└── config.local.json       # 本 skill 自己的配置（上传目的地、归档模板等）
 ```
+
+## config.local.json 键一览
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `platforms` | init 时确定 | 启用的平台列表 |
+| `video_dest` | `baidu` | 视频上传目的地（`baidu` / `feishu`），init 时询问 |
+| `image_dest` | `feishu` | 图片上传目的地（`baidu` / `feishu`），init 时询问 |
+| `baidu_base` | `social-media-download` | 百度盘归档根目录（相对 `/apps/bdpan`） |
+| `feishu_parent_folder_token` | `""`（根目录） | 飞书归档父文件夹 token |
+| `name_template` | `{date}` | 归档名模板（`{platform}` `{title}` `{author}` `{date}` `{day}`） |
+
+上传目的地优先级：`run --dest baidu/feishu`（全部走一侧）> `run --video-dest/--image-dest`（单次覆盖一类）> 此处配置 > 内置默认。配置或参数写了非法值会明确报错，不会静默回退。
 
 ## 登录状态一览
 

@@ -236,6 +236,22 @@ def re_split(s):
     return [t for t in (x.strip() for x in s.replace("，", ",").split(",")) if t]
 
 
+DEST_LABELS = {"baidu": "百度网盘", "feishu": "飞书云盘"}
+
+
+def ask_dest(kind: str, default: str) -> str:
+    """交互式询问某类媒体的默认上传目的地。"""
+    tip = "1" if default == "baidu" else "2"
+    log("%s默认传到哪？  1) 百度网盘  2) 飞书云盘（回车 = %s）"
+        % (kind, DEST_LABELS[default]))
+    raw = input("选择 [1/2，默认 %s]: " % tip).strip().lower()
+    if raw in ("1", "baidu"):
+        return "baidu"
+    if raw in ("2", "feishu"):
+        return "feishu"
+    return default
+
+
 def resolve_platforms(raw: str, non_interactive: bool) -> list:
     """把 --platforms 参数解析为平台列表；未指定且非交互时明确报错（B-1）。"""
     if raw:
@@ -267,7 +283,10 @@ def main(argv=None) -> int:
     ap.add_argument("--platforms", default="",
                     help="逗号分隔：bilibili,douyin,xiaohongshu；或 all。"
                          "非交互模式必填；交互模式留空则逐项询问")
-    ap.add_argument("--video-dest", default="baidu", choices=["baidu", "feishu"])
+    ap.add_argument("--video-dest", default="baidu", choices=["baidu", "feishu"],
+                    help="视频默认目的地（交互模式会询问，此为回车默认值）")
+    ap.add_argument("--image-dest", default="feishu", choices=["baidu", "feishu"],
+                    help="图片默认目的地（交互模式会询问，此为回车默认值）")
     ap.add_argument("--baidu-base", default="social-media-download")
     ap.add_argument("--feishu-parent", default="")
     ap.add_argument("--name-template", default=DEFAULT_CONFIG["name_template"])
@@ -283,6 +302,14 @@ def main(argv=None) -> int:
     if not enabled:
         return 1
     log("[init] 启用平台：%s" % ", ".join(enabled))
+
+    # 上传目的地：交互模式询问用户；非交互用 CLI 参数（有默认值）
+    if args.non_interactive:
+        video_dest, image_dest = args.video_dest, args.image_dest
+    else:
+        video_dest = ask_dest("视频", args.video_dest)
+        image_dest = ask_dest("图片", args.image_dest)
+    log("[init] 上传目的地：视频→%s，图片→%s" % (DEST_LABELS[video_dest], DEST_LABELS[image_dest]))
 
     log("== 1/4 检查系统依赖 ==")
     for name, ok, detail in check_bins():
@@ -315,7 +342,8 @@ def main(argv=None) -> int:
         except (OSError, ValueError):
             pass
     cfg["platforms"] = enabled
-    cfg["video_dest"] = args.video_dest
+    cfg["video_dest"] = video_dest
+    cfg["image_dest"] = image_dest
     cfg["baidu_base"] = args.baidu_base
     cfg["feishu_parent_folder_token"] = args.feishu_parent
     cfg["name_template"] = args.name_template

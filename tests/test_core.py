@@ -19,7 +19,7 @@ from backends import detect_platform, normalize_platform, platform_label  # noqa
 from backends.douyin import DouyinBackend  # noqa: E402
 from social_dl import (  # noqa: E402
     build_archive_name, build_manifest, clean_name, collect_media,
-    mask_secrets, plan_uploads,
+    mask_secrets, plan_uploads, resolve_dest,
 )
 from social_dl import _image_complete  # noqa: E402
 
@@ -183,9 +183,10 @@ class TestImageComplete(unittest.TestCase):
 
 
 class TestPlanUploads(unittest.TestCase):
-    """分流：auto 模式视频→百度、图片→飞书；显式 dest 覆盖一切。"""
+    """分流：auto 模式按配置决定目的地；显式 dest 覆盖一切；非法值报错。"""
 
-    def test_auto_split_mixed(self):
+    def test_auto_split_default(self):
+        """无配置时回退默认：视频→百度、图片→飞书。"""
         plan = plan_uploads("auto", ["a.jpg"], ["v.mp4"], {})
         self.assertEqual(plan, [("baidu", ["v.mp4"]), ("feishu", ["a.jpg"])])
 
@@ -197,10 +198,35 @@ class TestPlanUploads(unittest.TestCase):
         self.assertEqual(plan_uploads("auto", ["a.jpg"], [], {}),
                          [("feishu", ["a.jpg"])])
 
+    def test_auto_custom_dest(self):
+        """用户配置反向分流：视频→飞书、图片→百度。"""
+        plan = plan_uploads("auto", ["a.jpg"], ["v.mp4"],
+                            {"video_dest": "feishu", "image_dest": "baidu"})
+        self.assertEqual(plan, [("feishu", ["v.mp4"]), ("baidu", ["a.jpg"])])
+
+    def test_auto_same_dest_merges_types_not_files(self):
+        """视频图片同目标时仍按类型分两批，不混装。"""
+        plan = plan_uploads("auto", ["a.jpg"], ["v.mp4"],
+                            {"video_dest": "feishu", "image_dest": "feishu"})
+        self.assertEqual(plan, [("feishu", ["v.mp4"]), ("feishu", ["a.jpg"])])
+
+    def test_auto_invalid_cfg_dest_raises(self):
+        """配置写了非法目的地必须炸出来，不能静默回退。"""
+        with self.assertRaises(ValueError):
+            plan_uploads("auto", ["a.jpg"], [], {"image_dest": "onedrive"})
+
     def test_force_baidu(self):
         plan = plan_uploads("baidu", ["a.jpg"], ["v.mp4"], {})
         self.assertEqual(len(plan), 1)
         self.assertEqual(len(plan[0][1]), 2)
+
+    def test_resolve_dest_invalid(self):
+        with self.assertRaises(ValueError):
+            resolve_dest("onedrive", "baidu")
+
+    def test_resolve_dest_normalizes(self):
+        self.assertEqual(resolve_dest(" Feishu ", None), "feishu")
+        self.assertEqual(resolve_dest("", "baidu"), "baidu")
 
 
 class TestManifest(unittest.TestCase):
