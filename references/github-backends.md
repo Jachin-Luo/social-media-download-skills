@@ -29,3 +29,13 @@
 - GPL 项目通过独立 CLI/进程调用，不复制源码到本 Skill；保留上游许可证和版权信息。
 - 每次使用前可检查后端版本和帮助；平台登录、Cookie、验证码、代理和风控问题直接反馈。
 - 下载内容仅限用户有权保存或使用的内容，不绕过付费、DRM、访问控制或验证码。
+
+## PyPI 安装边界（2026-09-03 实测）
+
+| 上游 | PyPI 包 | 结论 |
+|---|---|---|
+| yutto-dev/yutto | `yutto`（官方发布，来源一致） | **可放心 `uv tool install yutto==<锁版本>`**，不 clone 源码、无 git 冲突 |
+| jiji262/douyin-downloader | `douyin-downloader` 1.0.4 | **同名陷阱**：PyPI 上是 HeLiangHIT/douyin_downloader，与 jiji262 无关。改成 pip 安装会装到错误项目。只能源码 clone |
+| JoeanAmier/XHS-Downloader | 无（404） | 不在 PyPI，只能源码 clone |
+
+> 有人想"简化成 pip 安装"时先查这张表。douyin 的同名包陷阱已同步写进 `scripts/requirements.lock` 的 note。

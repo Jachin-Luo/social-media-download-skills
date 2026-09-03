@@ -1,1 +1,33 @@
-{"changelog_policy": "升级前先读上游 releases/changelog，有 breaking change（参数、配置格式、登录逻辑）必须让用户拍板后再升", "lock_version": 1, "pins": {"XHS-Downloader": {"repo": "https://github.com/JoeanAmier/XHS-Downloader.git", "sha": "e9e0322", "verified": "2026-09-03", "note": "GPL-3.0，只调 CLI，不抄源码"}, "bdpan": {"version": "3.8.7", "verified": "2026-09-03", "note": "系统二进制，不进 vendor，只锁版本"}, "douyin-downloader": {"repo": "https://github.com/jiji262/douyin-downloader.git", "sha": "99bb559", "verified": "2026-09-03", "note": "fix: 修复直播回放进度停在零之后一位"}, "lark-cli": {"version": "1.0.80", "verified": "2026-09-03", "note": "远端已有 1.0.93 提示，按 changelog 流程让用户决定是否升级"}, "yutto": {"version": "2.3.0", "verified": "2026-09-03", "note": "-d 指定输出目录已验证"}}}
+{
+  "changelog_policy": "升级前先读上游 releases/changelog，有 breaking change（参数、配置格式、登录逻辑）必须让用户拍板后再升",
+  "lock_version": 1,
+  "pins": {
+    "XHS-Downloader": {
+      "repo": "https://github.com/JoeanAmier/XHS-Downloader.git",
+      "sha": "e9e0322",
+      "verified": "2026-09-03",
+      "note": "GPL-3.0，只调 CLI，不抄源码；上游不在 PyPI，只能源码 clone"
+    },
+    "bdpan": {
+      "version": "3.8.7",
+      "verified": "2026-09-03",
+      "note": "系统二进制，不进 vendor，只锁版本"
+    },
+    "douyin-downloader": {
+      "repo": "https://github.com/jiji262/douyin-downloader.git",
+      "sha": "99bb559",
+      "verified": "2026-09-03",
+      "note": "fix: 修复直播回放进度停在零之后一位；警告：PyPI 同名包 douyin-downloader 是 HeLiangHIT 的项目，与此无关，只能源码 clone"
+    },
+    "lark-cli": {
+      "version": "1.0.80",
+      "verified": "2026-09-03",
+      "note": "远端已有 1.0.93 提示，按 changelog 流程让用户决定是否升级"
+    },
+    "yutto": {
+      "version": "2.3.0",
+      "verified": "2026-09-03",
+      "note": "PyPI 官方包（yutto-dev/yutto 发布），uv tool install 按此版本安装，不 clone 源码；-d 指定输出目录已验证"
+    }
+  }
+}
