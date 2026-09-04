@@ -64,6 +64,7 @@ POLL_INTERVAL = 5
 
 # 归档名模板占位符
 DEFAULT_NAME_TEMPLATE = "{date}"
+ARCHIVE_PLACEHOLDERS = ("platform", "title", "author", "date", "day")
 INVALID_CHARS = re.compile(r'[\\/:*?"<>|\r\n\t]')
 
 
@@ -96,6 +97,13 @@ def build_archive_name(template: str, platform: str, meta: dict, started: str) -
     `--name-template "{platform}_{title}_{day}"` 换成可读形式。
     """
     meta = meta or {}
+    name = template or DEFAULT_NAME_TEMPLATE
+    # P2：模板里的未知占位符直接报错——否则 "{foo}" 会原样残留在目录名里。
+    # 只校验模板本身，不校验替换结果（标题里自带 "{x}" 文字不受影响）。
+    unknown = set(re.findall(r"\{([A-Za-z_]+)\}", name)) - set(ARCHIVE_PLACEHOLDERS)
+    if unknown:
+        raise ValueError("归档模板含未知占位符 %s（可用：%s）"
+                         % (sorted(unknown), ", ".join("{%s}" % p for p in ARCHIVE_PLACEHOLDERS)))
     values = {
         "platform": platform_label(platform),
         "title": clean_name(meta.get("title") or "", 40) or "无标题",
@@ -103,7 +111,6 @@ def build_archive_name(template: str, platform: str, meta: dict, started: str) -
         "date": started,
         "day": started[:10],
     }
-    name = template or DEFAULT_NAME_TEMPLATE
     for k, v in values.items():
         name = name.replace("{%s}" % k, v)
     return clean_name(name, 80) or started
@@ -166,7 +173,7 @@ def read_progress(backend, logfile, tail_lines: int = 40):
 
 # ---------------------------------------------------------------- 后台执行
 
-SECRET_RE = re.compile(r"(--(?:cookie|token|password|secret|key|auth)\S*)([= ])(\S+)", re.I)
+SECRET_RE = re.compile(r"(--(?:folder-token|api-key|cookie|token|password|secret|key|auth)\S*)([= ])(\S+)", re.I)
 
 
 def mask_secrets(s: str) -> str:
@@ -255,6 +262,13 @@ def _image_complete(p: Path) -> bool:
 
 def verify_local(files) -> list:
     bad = []
+    want_video = any(Path(f).suffix.lower() in VIDEO_EXT for f in files)
+    probe = shutil.which("ffprobe")
+    if want_video and probe is None:
+        # P1：环境缺 ffprobe 时原来会把每个视频都判坏（rc=127），报错却是
+        # "文件不完整"——用户会去查文件，其实是缺二进制。此时只做存在性
+        # 检查并明确告警，不判坏。
+        log("警告：未找到 ffprobe，跳过视频完整性探测（仅检查存在性与大小）")
     for f in files:
         p = Path(f)
         if not p.exists() or p.stat().st_size == 0:
@@ -262,7 +276,9 @@ def verify_local(files) -> list:
             continue
         suf = p.suffix.lower()
         if suf in VIDEO_EXT:
-            rc, _, _ = run_capture(["ffprobe", "-v", "quiet", "-show_format", str(p)], 60)
+            if probe is None:
+                continue
+            rc, _, _ = run_capture([probe, "-v", "quiet", "-show_format", str(p)], 60)
             if rc != 0:
                 bad.append(str(p))
         elif suf in IMAGE_EXT:
@@ -387,14 +403,19 @@ def feishu_verify(folder_token: str):
     """返回 (总数, parent_token 匹配数, 不匹配的文件名)。
 
     P1-4：SKILL.md 要求逐个比对 parent_token，而不是只数个数。
+    P2：单页取 200（上限）。刻意不用 --page-all——它输出每页一个 JSON
+    对象 + 进度行，run_json 解析必炸；超大图集命中 200 上限时明确告警。
     """
     cmd = ["lark-cli", "drive", "files", "list",
-           "--params", json.dumps({"folder_token": folder_token, "page_size": 100}),
+           "--params", json.dumps({"folder_token": folder_token, "page_size": 200}),
            "--format", "json"]
     rc, data = run_json(cmd, cwd=str(DATA_DIR))
     if rc != 0 or not data.get("ok"):
         return -1, -1, []
     files = (data.get("data") or {}).get("files", []) or []
+    if len(files) >= 200:
+        log("警告：飞书目录文件数已达单页上限 200，对账可能截断，"
+            "请拆小图集或手动确认远端")
     bad = [f.get("name", "?") for f in files if f.get("parent_token") != folder_token]
     return len(files), len(files) - len(bad), bad
 
@@ -413,11 +434,13 @@ def baidu_upload(local_file: str, remote_file: str, task_dir: str = "") -> tuple
     rc, tail = exec_bg(["bdpan", "upload", local_file, remote_file],
                        cwd=task_dir or "/tmp",
                        logfile=str(logdir / ("upload-%s.log" % tag)), timeout=1800)
-    # P1-6：中文关键词只做辅助判据（"成功"可能来自"失败后重试成功"，
-    # 也可能被进度输出挤出尾部），最终以远端对账为准。
+    # P1：中文关键词只做诊断备注，不做门控（措辞可能随 bdpan 版本变化，
+    # 且"成功"二字可能被进度输出挤出尾部）。成功与否以退出码为准，
+    # 最终以 baidu_final_ok 里的远端对账为准。
     joined = "\n".join(tail)
     kw = ("上传成功" in joined) or ("成功" in "\n".join(tail[-3:]))
-    return (rc == 0 and kw), rc, joined[-500:]
+    note = "" if kw else "\n[注：日志尾未见成功关键词，以退出码+远端对账为准]"
+    return (rc == 0), rc, (joined[-500:] + note)
 
 
 def baidu_verify(remote_dir: str) -> int:
@@ -473,6 +496,19 @@ def upload_to_feishu(files, name, cfg, task_dir, result) -> bool:
     return ok
 
 
+def baidu_final_ok(ok_all: bool, remote_count: int, expected: int) -> bool:
+    """百度上传最终判定：远端对账为准，回执为辅。
+
+    - remote_count >= 0（对账可用）：远端文件数 >= 预期即成功。
+      回执里的中文关键词只是辅助信号（措辞可能随版本变化），不做门控。
+    - remote_count == -1（对账不可用，如 bdpan 不支持 --json）：
+      回退到逐文件回执判定。
+    """
+    if remote_count >= 0:
+        return remote_count >= expected
+    return ok_all
+
+
 def upload_to_baidu(files, name, cfg, task_dir, result) -> bool:
     base = cfg.get("baidu_base", "social-media-download")
     rdir = unique_remote_dir(base, name)
@@ -490,13 +526,18 @@ def upload_to_baidu(files, name, cfg, task_dir, result) -> bool:
     result["baidu"] = {"remote_dir": rdir,
                        "uploaded": sum(1 for x in ups if x["ok"]),
                        "expected": len(files),
-                       "remote_count": n}
-    if not ok_all:
+                       "remote_count": n,
+                       "verified": n >= 0}
+    ok = baidu_final_ok(ok_all, n, len(files))
+    if not ok:
         result.setdefault("errors", []).append(
-            {"stage": "upload-baidu", "failed": [x for x in ups if not x["ok"]][:5]})
+            {"stage": "upload-baidu",
+             "detail": "远端未确认成功：回执 %d/%d，远端 %s/%d（目录 %s）" %
+                       (sum(1 for x in ups if x["ok"]), len(files), n, len(files), rdir),
+             "failed": [x for x in ups if not x["ok"]][:5]})
     # remote_count == -1 表示对账不可用（如 bdpan 不支持 --json），
     # 此时只以上传回执为准，不因此判失败
-    return ok_all
+    return ok
 
 
 VALID_DESTS = ("baidu", "feishu")
@@ -546,11 +587,20 @@ def _run_inner(args, task_dir, started, result) -> int:
     backend = get_backend(platform, DATA_DIR)
     result.update(platform=platform, backend=backend.name,
                   install_mode=backend.install_mode())
-    # 记录平台元信息，供 poll 推断后端以解析进度
+    # 记录平台元信息，供 poll 推断后端以解析进度、给出可恢复命令。
+    # P1：同时记录 url——断点续跑必须校验是同一个链接，否则会把旧目录的
+    # 成品当成新链接的内容上传（静默传错）。老目录没有 url 键则跳过校验。
+    meta_file = Path(task_dir) / "run_meta.json"
+    prev_url = ""
+    if meta_file.exists():
+        try:
+            prev_url = json.loads(meta_file.read_text(encoding="utf-8")).get("url", "") or ""
+        except (OSError, ValueError):
+            prev_url = ""
     try:
-        (Path(task_dir) / "run_meta.json").write_text(
-            json.dumps({"platform": platform, "backend": backend.name},
-                       ensure_ascii=False), encoding="utf-8")
+        meta_file.write_text(
+            json.dumps({"platform": platform, "backend": backend.name,
+                        "url": args.url}, ensure_ascii=False), encoding="utf-8")
     except OSError:
         pass
 
@@ -567,6 +617,12 @@ def _run_inner(args, task_dir, started, result) -> int:
 
     # --- 下载（断点续跑沿用原逻辑：上次 exit 0 且已有成品文件则跳过） ---
     if args.task and log_exit(logpath) == 0:
+        if prev_url and prev_url != args.url:
+            result.update(ok=False, stage="parse", error="task_url_mismatch",
+                          detail="任务目录 %s 上次下载的是另一链接" % task_dir,
+                          hint="换 --task 新目录跑本次链接，或用原链接 resume："
+                               "social_dl.py run --url %s --task %s" % (prev_url, task_dir))
+            return 1
         pre_imgs, pre_vids = collect_media(task_dir)
         if pre_imgs or pre_vids:
             log("[run] 断点续跑：沿用已完成的下载")
@@ -582,7 +638,8 @@ def _run_inner(args, task_dir, started, result) -> int:
                           capability=e.capability, detail=str(e),
                           hint="上游 CLI 参数可能已变更，跑 `doctor` 确认后更新适配器 CAPS")
             return 1
-        rc, tail = exec_bg(cmd, cwd=str(task_dir), logfile=logpath, timeout=timeout)
+        rc, tail = exec_bg(cmd, cwd=str(backend.run_cwd(Path(task_dir))),
+                           logfile=logpath, timeout=timeout)
 
     if rc == 124:
         result.update(ok=False, stage="download", status="running",
@@ -627,7 +684,14 @@ def _run_inner(args, task_dir, started, result) -> int:
         result["local_manifest"] = manifest_path
         return 0
 
-    name = args.name or build_archive_name(args.name_template, platform, meta, started)
+    name = args.name or ""
+    if not name:
+        try:
+            name = build_archive_name(args.name_template, platform, meta, started)
+        except ValueError as e:
+            result.update(ok=False, stage="upload", error="invalid_archive_name",
+                          hint=str(e))
+            return 1
     cfg = load_config()
     # CLI 覆盖 > 配置 > 默认；非法值明确报错，绝不静默回退
     try:
@@ -700,11 +764,13 @@ def cmd_poll(args) -> int:
     pid = read_pid(logpath)
     code = log_exit(logpath)
     imgs, vids = collect_media(task_dir)
-    platform, progress = "", None
+    platform, progress, task_url = "", None, ""
     meta_file = task_dir / "run_meta.json"
     if meta_file.exists():
         try:
-            platform = json.loads(meta_file.read_text(encoding="utf-8")).get("platform", "")
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            platform = meta.get("platform", "") or ""
+            task_url = meta.get("url", "") or ""
         except (OSError, ValueError):
             pass
     if platform:
@@ -712,13 +778,33 @@ def cmd_poll(args) -> int:
             progress = read_progress(get_backend(platform, DATA_DIR), logpath)
         except BackendError:
             pass
+    # P1：超时返回（124）后进程若又退出了，日志里永远不会补 [exit N]，
+    # 此时 exit 恒为 null、resume 恒为空——必须显式报出这种"结束但无标记"态。
+    alive = pid_alive(pid)
+    if code is None and pid > 0 and not alive and (task_dir / "download.log").exists():
+        state = "ended_unmarked"
+        state_hint = ("下载进程已结束，但日志缺少退出标记（多为此前超时返回后"
+                      "后台跑完）。目录内若已有成品文件，可用原链接 resume 重跑"
+                      "完成后半程（下载→校验→上传）。")
+    elif code is None and alive:
+        state, state_hint = "running", "进程仍在后台运行，凭 task 目录续看，不要重复启动"
+    elif code == 0:
+        state, state_hint = "done", ""
+    elif code is None:
+        state, state_hint = "unknown", "无退出标记且进程不在运行，可能从未启动或日志被清理"
+    else:
+        state, state_hint = "failed", ""
+    resume = ""
+    if task_url and state in ("done", "ended_unmarked"):
+        resume = "social_dl.py run --url %s --task %s" % (task_url, task_dir)
     print(json.dumps({
         "task_dir": str(task_dir),
-        "download": {"pid": pid, "alive": pid_alive(pid),
-                     "exit": code, "tail": log_tail(logpath, 8)},
+        "download": {"pid": pid, "alive": alive,
+                     "exit": code, "state": state, "state_hint": state_hint,
+                     "tail": log_tail(logpath, 8)},
         "progress": progress,
         "media": {"images": len(imgs), "videos": len(vids)},
-        "resume": ("social_dl.py run --url <链接> --task %s" % task_dir) if code == 0 else "",
+        "resume": resume,
     }, ensure_ascii=False))
     return 0
 

@@ -16,9 +16,10 @@ SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from backends import detect_platform, normalize_platform, platform_label  # noqa: E402
+from backends.bilibili import BilibiliBackend  # noqa: E402
 from backends.douyin import DouyinBackend  # noqa: E402
 from social_dl import (  # noqa: E402
-    build_archive_name, build_manifest, clean_name, collect_media,
+    baidu_final_ok, build_archive_name, build_manifest, clean_name, collect_media,
     mask_secrets, plan_uploads, resolve_dest,
 )
 from social_dl import _image_complete  # noqa: E402
@@ -251,9 +252,60 @@ class TestMaskSecrets(unittest.TestCase):
         self.assertNotIn("abc123", s)
         self.assertIn("***", s)
 
+    def test_folder_token_masked(self):
+        """P2：--folder-token 之前漏网，凭证会进落盘日志。"""
+        s = mask_secrets("lark-cli drive +upload --file ./a.jpg --folder-token secret123")
+        self.assertNotIn("secret123", s)
+        self.assertIn("--folder-token ***", s)
+
     def test_plain_kept(self):
         self.assertEqual(mask_secrets("yutto url -d dir"),
                          "yutto url -d dir")
+
+
+class TestArchiveNameUnknown(unittest.TestCase):
+    """P2：未知占位符直接报错；标题自带花括号不受影响。"""
+
+    def test_unknown_placeholder_raises(self):
+        with self.assertRaises(ValueError):
+            build_archive_name("{platform}_{foo}_{day}", "douyin",
+                               {"title": "T"}, "2026-09-03_21-45-41")
+
+    def test_title_braces_untouched(self):
+        name = build_archive_name("{platform}_{title}", "douyin",
+                                  {"title": "实测{x}合集"}, "2026-09-03_21-45-41")
+        self.assertIn("实测", name)
+        self.assertIn("抖音", name)
+
+
+class TestBaiduFinalOk(unittest.TestCase):
+    """P1：百度最终判定以远端对账为准，回执只做降级。"""
+
+    def test_verify_match_wins(self):
+        self.assertTrue(baidu_final_ok(True, 3, 3))
+        # 回执全挂但远端数对上——照样算成功（关键词措辞不可靠）
+        self.assertTrue(baidu_final_ok(False, 3, 3))
+
+    def test_verify_mismatch_fails(self):
+        self.assertFalse(baidu_final_ok(True, 2, 3))
+
+    def test_verify_unavailable_falls_back(self):
+        self.assertTrue(baidu_final_ok(True, -1, 3))
+        self.assertFalse(baidu_final_ok(False, -1, 3))
+
+
+class TestRunCwd(unittest.TestCase):
+    """P0：vendor 后端必须跑在 vendor 目录，pypi 后端用 task_dir。"""
+
+    def test_vendor_backend_uses_vendor_dir(self):
+        tmp = Path(tempfile.mkdtemp())
+        b = DouyinBackend(tmp)
+        self.assertEqual(b.run_cwd(tmp / "task-1"), tmp / "douyin-downloader")
+
+    def test_pypi_backend_uses_task_dir(self):
+        tmp = Path(tempfile.mkdtemp())
+        b = BilibiliBackend(tmp)
+        self.assertEqual(b.run_cwd(tmp / "task-1"), tmp / "task-1")
 
 
 if __name__ == "__main__":

@@ -100,6 +100,17 @@ class Backend(ABC):
         """'pypi'（包管理器安装）或 'vendor'（源码 clone）。"""
         return "vendor"
 
+    def run_cwd(self, task_dir: Path) -> Path:
+        """执行下载命令的工作目录。
+
+        P0：源码型后端必须跑在 vendor 目录——`uv run` 靠 cwd 向上发现
+        项目环境，在 /tmp 的 task_dir 里跑会报 spawned 命令不存在 /
+        模块导入失败。pypi 型后端无此约束，用 task_dir。
+        """
+        if self.install_mode() == "vendor":
+            return self.vendor_dir()
+        return Path(task_dir)
+
     def available(self) -> tuple[bool, str]:
         """后端是否已安装可用。默认检查 exe 首个 token 是否在 PATH。"""
         head = self.exe()[0]
@@ -144,9 +155,12 @@ class Backend(ABC):
         return self._help_flags
 
     def _probe_help(self) -> set[str]:
+        # P0：协商探测也要跑在 vendor 目录，否则 `uv run` 找不到项目环境，
+        # 对 vendor 后端永远探测失败、永远降级为 unverified 首选参数。
+        cwd = str(self.vendor_dir()) if self.install_mode() == "vendor" else None
         try:
             p = subprocess.run(self.exe() + ["--help"], capture_output=True,
-                               text=True, timeout=120)
+                               text=True, timeout=120, cwd=cwd)
         except (OSError, subprocess.SubprocessError):
             return set()
         # 只取行首的 -x / --xxx，避免把参数值里的词当参数

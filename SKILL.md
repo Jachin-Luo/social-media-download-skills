@@ -8,7 +8,7 @@ description: >
   当用户提供这三类平台的分享链接（含 b23.tv / v.douyin.com / xhslink.com 短链）
   并要求下载、保存、归档、备份时使用。不用于绕过付费墙、DRM、登录权限，
   不用于批量抓取他人账号，不用于传播受版权保护的内容。
-version: 0.3.1
+version: 0.3.2
 author: 雒玉坤 (Jachin), Hermes Agent
 license: MIT
 allowed-tools: Bash, Read, Write
@@ -73,12 +73,12 @@ python3 scripts/social_dl.py upload-baidu  --task <task_dir> --name "<归档名>
 1. **解析输入**：提取合法 URL，识别平台。无法识别直接返回 `invalid_input`。
 2. **后端检查**：`available()` 确认后端已装；`prepare()` 做任务准备（抖音派生 `link: []` 的隔离 config）。
 3. **下载**：`exec_bg` 后台执行（pid + 日志 + 轮询）。退出码非零或 0 文件即失败；0 文件时自动查登录态并给出可行动提示（Cookie 过期是 exit 0 但 0 文件的首要原因）。
-4. **验证文件**：存在、>0；视频 ffprobe 校验，图片做头+尾完整性校验（截断的 JPEG 头是完整的，只验头会放过）。
+4. **验证文件**：存在、>0；视频 ffprobe 校验（环境缺 ffprobe 时跳过视频探测并明确告警，不判坏），图片做头+尾完整性校验（截断的 JPEG 头是完整的，只验头会放过）。
 5. **溯源 manifest**：在任务目录写 `manifest.json`（来源 URL、平台、标题、作者、下载时间、文件清单），随归档一起进云盘。
-6. **归档命名**：默认时间戳；`--name-template` 可用 `{platform}` `{title}` 等占位符。模板清洗非法字符，标题缺失回退"无标题"。
+6. **归档命名**：默认时间戳；`--name-template` 可用 `{platform}` `{title}` 等占位符。模板清洗非法字符，标题缺失回退"无标题"。模板里的未知占位符直接报错（可用：`{platform}` `{title}` `{author}` `{date}` `{day}`）。
 7. **分流上传**：auto 模式按配置分流——视频→`video_dest`（默认百度）、图片→`image_dest`（默认飞书），混合媒体绝不混装。目的地优先级：`--dest baidu/feishu`（全部走一侧）> `--video-dest`/`--image-dest`（单次覆盖）> `config.local.json` > 默认值；非法值明确报错。init 时向导会逐项询问用户。飞书先建任务文件夹再串行上传（同名文件自动去重）；百度上传后 `--json` 对账。
 8. **远端对账**：飞书逐文件比对 `parent_token`；百度数非目录项。对账不过即失败，明确报告"远端未确认成功"。
-9. **清理与报告**：无论成败，`finally` 里删除任务目录并如实上报 `cleaned`/`residue`。成功列出平台、标题、归档名、远程位置、清理状态；失败列出阶段、后端、退出码、原始错误和可行动的 hint。
+9. **清理与报告**：`--cleanup` 时在 `finally` 里删除任务目录并如实上报 `cleaned`/`residue`；不带 `--cleanup` 则保留目录（供复查/重传）并上报路径。成功列出平台、标题、归档名、远程位置、清理状态；失败列出阶段、后端、退出码、原始错误和可行动的 hint。
 
 ## Error Handling
 

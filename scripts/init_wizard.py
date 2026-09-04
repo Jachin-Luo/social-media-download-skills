@@ -319,6 +319,12 @@ def main(argv=None) -> int:
     for k, (ok, detail) in check_logins(enabled).items():
         log("  [%s] %s: %s" % ("OK" if ok else "--", k, detail))
 
+    # P1：--yes 门控必须在安装之前——原来先 clone/install、最后才看 --yes，
+    # "只检查不写配置"名不副实（安装已经做了）。
+    if args.non_interactive and not args.yes:
+        log("  --non-interactive 未带 --yes：只做上面两步检查，不安装后端、不写配置。")
+        return 0
+
     log("== 3/4 安装启用的后端 ==")
     lock = load_lock()
     pins = lock.get("pins", {})
@@ -331,9 +337,6 @@ def main(argv=None) -> int:
         ok_all &= ensure_repo("xiaohongshu", pins.get("XHS-Downloader", {}).get("sha", ""))
 
     log("== 4/4 写 config.local.json ==")
-    if args.non_interactive and not args.yes:
-        log("  --non-interactive 未带 --yes：只检查不写配置。")
-        return 0 if ok_all else 1
     cfg = dict(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
         try:
